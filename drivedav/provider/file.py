@@ -25,12 +25,15 @@ class DriveDAVFile(DriveDAVResource, DAVNonCollection):
 
         return True
 
-    def support_etag(self) -> bool:
+    def support_ranges(self) -> bool:
         """
-        是否支持ETag
+        是否支持分片下载
+        后端声明 supports_ranges=True（且 read_file 返回 可 seek 流）才开启，
+        此时 WsgiDAV 回 206 + Content-Range
+        未声明的后端保持 False
         """
 
-        return True
+        return bool(getattr(self._drive, "supports_ranges", False))
 
     def support_ranges(self) -> bool:
         """
