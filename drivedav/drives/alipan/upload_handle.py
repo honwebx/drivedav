@@ -2,6 +2,7 @@ import math
 import time
 import requests
 from ...core.drive_upload_handle import DriveUploadHandle
+from .error import AlipanError
 
 _CHUNK_SIZE = 4 * 1024 * 1024
 _UPLOAD_URL_TTL = 3600
@@ -67,7 +68,10 @@ class AlipanUploadHandle(DriveUploadHandle):
             upload_url = self._get_part_url(part_number)
             resp = requests.put(upload_url, data=data)
             resp.raise_for_status()
-        except Exception:
+        except requests.RequestException as e:
+            self._abort()
+            raise AlipanError.parse_response(getattr(e, "response", None), e) from e
+        except Exception as e:
             self._abort()
             raise
 

@@ -1,7 +1,7 @@
 from typing import BinaryIO
 from wsgidav.dav_provider import DAVNonCollection
 from .resource import DriveDAVResource
-from .error import error_to_dav
+from .error import error_to_dav, DavUploadHandle
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -25,22 +25,22 @@ class DriveDAVFile(DriveDAVResource, DAVNonCollection):
 
         return True
 
+    def support_etag(self) -> bool:
+        """
+        是否支持ETag
+        """
+
+        return True
+
     def support_ranges(self) -> bool:
         """
         是否支持分片下载
-        后端声明 supports_ranges=True（且 read_file 返回 可 seek 流）才开启，
-        此时 WsgiDAV 回 206 + Content-Range
-        未声明的后端保持 False
+        按后端 opt-in：后端声明 supports_ranges=True（且 read_file 返回
+        可 seek 流）才开启，此时 WsgiDAV 回 206 + Content-Range；
+        未声明的后端保持 False（旧行为：Range 透传 CDN 但对外只发 200）。
         """
 
         return bool(getattr(self._drive, "supports_ranges", False))
-
-    def support_ranges(self) -> bool:
-        """
-        是否支持分片下载
-        """
-
-        return False
 
     def get_content_length(self) -> int | None:
         """
@@ -97,7 +97,12 @@ class DriveDAVFile(DriveDAVResource, DAVNonCollection):
         content_length = self._environ.get("CONTENT_LENGTH")
         file_size = int(content_length) if content_length else None
 
-        self._upload_handle = self._drive.open_writer(self._path, file_size)
+        try:
+            self._upload_handle = DavUploadHandle(
+                self._drive.open_writer(self._path, file_size)
+            )
+        except Exception as e:
+            raise error_to_dav(e)
         return self._upload_handle
 
     def end_write(self, with_errors):
@@ -108,5 +113,8 @@ class DriveDAVFile(DriveDAVResource, DAVNonCollection):
         if not self._upload_handle:
             return
 
-        self._upload_handle.close()
-        self._upload_handle = None
+        try:
+            self._upload_handle.close()
+        finally:
+            self._upload_handle = None
+            self._invalidate_meta(self._path)
