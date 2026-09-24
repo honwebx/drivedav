@@ -73,11 +73,20 @@ DriveBackend中的抽象方法必须实现，可参考alipan/backend.py的实现
 | get_meta    | 获取资源元数据，包括目录和文件，成功返回字典数据，资源不存在返回None。<br />数据结构如下：<br />- name：资源名称，字符串值或None；<br />- size：文件大小，目录可不需要，单位：字节；<br />- created：资源创建时间的Unix timestamp；<br />- modified：资源最后修改时间的Unix timestamp；<br />- etag：文件的SHA，没有返回None；<br />- mime：文件的MIME类型；<br />- is_dir：是否为目录，布尔值：True \| False。 |
 | list_dir    | 获取目录下子项名称列表：[name, name2...]                     |
 | make_dir    | 创建目录，不用考虑多级，系统会自动处理多级的情况。           |
-| read_file   | 读取文件流，返回requests的有效响应。requests请求时，使用参数stream=True |
+| read_file   | 读取文件流，返回requests的有效响应，requests请求时使用参数stream=True。<br />接收 headers 字典参数（可能包含 Range，用于分片下载）。 |
 | open_writer | 上传文件，实现DriveUploadHandle抽象类，返回上传对象。<br />- write：客户端上传的文件流通过该方法写入；<br />- close：文件流写入完成时调用。 |
 | delete      | 删除资源                                                     |
 | move        | 移动/重命名资源                                              |
 | copy        | 复制资源                                                     |
+
+### 分片下载：
+
+后端可声明类属性 `supports_ranges = True` 开启 206 分片响应（需 `read_file` 返回可 seek 流）。默认 `False`，Range 头仍透传给后端但对外只回 200。
+
+```
+class MyBackend(DriveBackend):
+    supports_ranges = True
+```
 
 ### 可用工具：
 
@@ -158,6 +167,7 @@ raise FileNotFound("NotFound.File", "文件不存在...", "响应ID")
 | TokenExpired       | Token过期，常见状态码：401            |
 | RateLimitExceeded  | API限制，常见状态码：429              |
 | PermissionDenied   | 请求被拒绝，常见状态码：403           |
+| RangeNotSatisfiable| 请求范围无效，常见状态码：416         |
 | ServiceUnavailable | 服务不可用，常见状态码：500、502、503 |
 | DriveError         | 其他错误                              |
 
