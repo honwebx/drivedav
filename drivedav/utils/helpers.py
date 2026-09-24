@@ -13,7 +13,6 @@ def normalize_path(path: str) -> str:
     has_trailing_slash = path.endswith("/")
     path = path.split("?", 1)[0].split("#", 1)[0]
     path = unquote(path)
-    path = path.replace("%2F", "/").replace("%2f", "/")
     path = posixpath.normpath(path)
 
     if not path.startswith("/"):
@@ -145,7 +144,13 @@ def is_valid_host(host: str) -> bool:
     except ValueError:
         pass
 
-    domain_regex = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z]{2,})+$"
+    if not host or len(host) > 253:
+        return False
+
+    if host == "localhost":
+        return True
+
+    domain_regex = r"^(?!-)[A-Za-z0-9-]{1,63}(?<!-)(\.[A-Za-z0-9-]{1,63})*(\.[A-Za-z]{2,})?$"
     return re.match(domain_regex, host) is not None
 
 def is_valid_port(port: str) -> bool:

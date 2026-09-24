@@ -59,8 +59,24 @@ def config_main():
                 return
             else:
                 print("无效选项，请重新输入。")
-    except KeyboardInterrupt:
+    except (KeyboardInterrupt, EOFError):
         print("\n已退出配置菜单")
+
+def _load_drive_module(drive_type: str):
+    try:
+        return importlib.import_module(f"..drives.{drive_type}", package=__package__)
+    except ModuleNotFoundError:
+        return None
+
+def _drive_entries(all_drives: dict):
+    entries = []
+    for name in sorted(all_drives.keys()):
+        item = all_drives.get(name)
+        drive_type = item.get("type", "unknown") if isinstance(item, dict) else "unknown"
+        module = _load_drive_module(drive_type)
+        label = getattr(module, "NAME", drive_type) if module else f"{drive_type}（不可用）"
+        entries.append((name, drive_type, label))
+    return entries
 
 def show_drive(cfg_manager: GlobalConfigManager):
     """
@@ -72,18 +88,7 @@ def show_drive(cfg_manager: GlobalConfigManager):
     if not all_drives:
         return
 
-    rows = []
-    for name, item in all_drives.items():
-        drive_type = item.get("type")
-        if not drive_type: continue
-        try:
-            module = importlib.import_module(f"..drives.{drive_type}", package=__package__)
-            rows.append([name, getattr(module, "NAME", drive_type)])
-        except ModuleNotFoundError:
-            pass
-
-    if not rows:
-        return
+    rows = [[name, label] for name, _, label in _drive_entries(all_drives)]
 
     print("\n已配置的网盘：")
     print(tabulate(
@@ -99,7 +104,7 @@ def new_drive(cfg_manager: GlobalConfigManager):
     drives_dir = Path(__file__).parent.parent / "drives"
     drive_types = sorted(
         p.name for p in drives_dir.iterdir()
-        if p.is_dir() and p.name != "__pycache__"
+        if p.is_dir() and p.name != "__pycache__" and _load_drive_module(p.name) is not None
     )
 
     if not drive_types:
@@ -107,15 +112,16 @@ def new_drive(cfg_manager: GlobalConfigManager):
         return
 
     for idx, d in enumerate(drive_types, start=1):
-        try:
-            module = importlib.import_module(f"..drives.{d}", package=__package__)
-            print(f"{idx:>2}) {getattr(module, 'NAME', d)}")
-        except ModuleNotFoundError:
-            pass
+        module = _load_drive_module(d)
+        print(f"{idx:>2}) {getattr(module, 'NAME', d)}")
 
     # 选择网盘类型
+    drive_type = None
     while True:
-        choice = input("输入数字选择网盘 > ").strip()
+        try:
+            choice = input("输入数字选择网盘 > ").strip()
+        except EOFError:
+            return
         if not choice.isdigit():
             print("请输入数字。")
             continue
@@ -130,8 +136,12 @@ def new_drive(cfg_manager: GlobalConfigManager):
     # 输入名称
     all_drives = cfg_manager.section("drive").load()
 
+    name = None
     while True:
-        name = input("请输入名称: ").strip()
+        try:
+            name = input("请输入名称: ").strip()
+        except EOFError:
+            return
 
         if not name:
             print("名称不能为空")
@@ -147,19 +157,48 @@ def new_drive(cfg_manager: GlobalConfigManager):
 
         break
 
-    module = importlib.import_module(f"..drives.{drive_type}", package=__package__)
+    module = _load_drive_module(drive_type)
+    if module is None:
+        print(f"网盘类型不可用：{drive_type}")
+        return
     drive_config = DriveConfig(cfg_manager, name)
     backend = module.Backend(drive_config)
-    
+
     try:
         config = backend.config(is_new=True)
     except DriveError as e:
         print(f"配置失败：{e.message}")
         return
-        
+
+    if not isinstance(config, dict):
+        print("配置失败：后端返回非法配置")
+        return
+
     config["type"] = drive_type
 
     cfg_manager.section(f"drive.{name}").save(config)
+
+def _pick_drive(entries, prompt: str):
+    print("已配置的网盘：")
+    print(tabulate(
+        [[idx, name, label] for idx, (name, _, label) in enumerate(entries, start=1)],
+        colalign=["right", "left", "left"],
+        tablefmt="simple",
+    ))
+
+    while True:
+        try:
+            choice = input(prompt).strip()
+        except EOFError:
+            return None
+        if not choice.isdigit():
+            print("请输入数字")
+            continue
+
+        choice = int(choice)
+        if 1 <= choice <= len(entries):
+            return entries[choice - 1]
+        print("无效输入，请重新输入")
 
 def edit_drive(cfg_manager: GlobalConfigManager):
     """
@@ -172,57 +211,27 @@ def edit_drive(cfg_manager: GlobalConfigManager):
         print("当前没有任何网盘配置")
         return
 
-    drive_names = sorted(all_drives.keys())
+    picked = _pick_drive(_drive_entries(all_drives), "输入数字选择要编辑的网盘 > ")
+    if picked is None:
+        return
+    name, drive_type, _ = picked
 
-    # 列出所有 drive
-    rows = []
-    for idx, name in enumerate(drive_names, start=1):
-        drive_type = all_drives[name].get("type", "unknown")
-        try:
-            module = importlib.import_module(f"..drives.{drive_type}", package=__package__)
-            rows.append([idx, name, getattr(module, "NAME", drive_type)])
-        except ModuleNotFoundError:
-            pass
-
-    print("已配置的网盘：")
-    print(tabulate(
-        rows,
-        colalign=["right", "left", "left"],
-        tablefmt="simple",
-    ))
-
-    # 选择要编辑的 drive
-    while True:
-        choice = input("输入数字选择要编辑的网盘 > ").strip()
-        if not choice.isdigit():
-            print("请输入数字")
-            continue
-
-        choice = int(choice)
-        if 1 <= choice <= len(drive_names):
-            name = drive_names[choice - 1]
-            break
-        else:
-            print("无效输入，请重新输入")
-
-    # 加载旧配置
-    section = cfg_manager.section(f"drive.{name}")
-    old_config = section.load()
-
-    drive_type = old_config.get("type")
-    if not drive_type:
-        print("配置损坏：缺少网盘类型")
+    module = _load_drive_module(drive_type)
+    if module is None:
+        print(f"网盘类型不可用：{drive_type}")
         return
 
-    # 加载 backend
-    module = importlib.import_module(f"..drives.{drive_type}", package=__package__)
     drive_config = DriveConfig(cfg_manager, name)
     backend = module.Backend(drive_config)
-    
+
     try:
         new_config = backend.config(is_new=False)
     except DriveError as e:
         print(f"配置失败：{e.message}")
+        return
+
+    if not isinstance(new_config, dict):
+        print("配置失败：后端返回非法配置")
         return
 
     drive_config.save(new_config)
@@ -238,39 +247,17 @@ def delete_drive(cfg_manager: GlobalConfigManager):
         print("当前没有任何网盘配置")
         return
 
-    drive_names = sorted(all_drives.keys())
-
-    rows = []
-    for idx, name in enumerate(drive_names, start=1):
-        drive_type = all_drives[name].get("type", "unknown")
-        try:
-            module = importlib.import_module(f"..drives.{drive_type}", package=__package__)
-            rows.append([idx, name, getattr(module, "NAME", drive_type)])
-        except ModuleNotFoundError:
-            pass
-    
-    print("已配置的网盘：")
-    print(tabulate(
-        rows,
-        colalign=["right", "left", "left"],
-        tablefmt="simple",
-    ))
-
-    while True:
-        choice = input("输入数字选择要删除的网盘 > ").strip()
-        if not choice.isdigit():
-            print("请输入数字")
-            continue
-
-        choice = int(choice)
-        if 1 <= choice <= len(drive_names):
-            name = drive_names[choice - 1]
-            break
-        else:
-            print("无效输入，请重新输入")
+    picked = _pick_drive(_drive_entries(all_drives), "输入数字选择要删除的网盘 > ")
+    if picked is None:
+        return
+    name = picked[0]
 
     # 二次确认
-    confirm = input(f"确认删除网盘 '{name}'? (Y/n) > ").strip().lower()
+    try:
+        confirm = input(f"确认删除网盘 '{name}'? (Y/n) > ").strip().lower()
+    except EOFError:
+        print("已取消删除")
+        return
     if confirm != "y":
         print("已取消删除")
         return
@@ -292,7 +279,11 @@ def manage_users(cfg_manager: GlobalConfigManager):
         print("3) 删除用户")
         print("4) 返回上级菜单")
 
-        choice = input("> ").strip()
+        try:
+            choice = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
 
         if choice == "1":
             add_user(cfg_manager)
@@ -322,7 +313,7 @@ def add_user(cfg_manager: GlobalConfigManager):
         print("用户名不能为空")
         return
 
-    password = input("输入密码 > ").strip()
+    password = getpass("输入密码 > ").strip()
     if not password:
         print("密码不能为空")
         return
@@ -348,7 +339,7 @@ def edit_user(cfg_manager: GlobalConfigManager):
 
     print(f"当前用户：{user.get('username')}")
 
-    new_password = input("输入新密码（留空则不修改） > ").strip()
+    new_password = getpass("输入新密码（留空则不修改） > ").strip()
     if new_password:
         user["password"] = new_password
         section.save(user)
@@ -368,7 +359,11 @@ def delete_user(cfg_manager: GlobalConfigManager):
         print("当前没有用户")
         return
 
-    confirm = input(f"确认删除用户 '{user.get('username')}'? (Y/n) > ").strip().lower()
+    confirm = None
+    try:
+        confirm = input(f"确认删除用户 '{user.get('username')}'? (Y/n) > ").strip().lower()
+    except EOFError:
+        pass
     if confirm != "y":
         print("已取消删除")
         return
@@ -387,7 +382,11 @@ def config_password(cfg_manager: GlobalConfigManager):
         print("2. 删除密码")
         print("3. 返回上级菜单")
 
-        choice = input("> ").strip()
+        try:
+            choice = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
 
         if choice == "1":
             set_config_password(cfg_manager)
@@ -430,7 +429,11 @@ def delete_config_password(cfg_manager: GlobalConfigManager):
         print("当前没有设置配置文件密码")
         return
 
-    confirm = input("确认删除密码？(Y/n) > ").strip().lower()
+    confirm = None
+    try:
+        confirm = input("确认删除密码？(Y/n) > ").strip().lower()
+    except EOFError:
+        pass
     if confirm != "y":
         print("已取消删除")
         return
@@ -453,7 +456,11 @@ def ssl_cert(cfg_manager: GlobalConfigManager):
         print("2) 删除证书配置")
         print("3) 返回上级菜单")
 
-        choice = input("> ").strip()
+        try:
+            choice = input("> ").strip()
+        except (KeyboardInterrupt, EOFError):
+            print()
+            return
 
         if choice == "1":
             configure_ssl_cert(cfg_manager)
@@ -516,7 +523,11 @@ def delete_ssl_cert(cfg_manager: GlobalConfigManager):
         print("当前没有 SSL 证书配置")
         return
 
-    confirm = input("确认删除 SSL 证书配置？(Y/n) > ").strip().lower()
+    confirm = None
+    try:
+        confirm = input("确认删除 SSL 证书配置？(Y/n) > ").strip().lower()
+    except EOFError:
+        pass
     if confirm != "y":
         print("已取消删除")
         return

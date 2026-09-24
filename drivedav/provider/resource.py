@@ -1,4 +1,4 @@
-import os
+import posixpath
 from .error import error_to_dav
 from ..core.drive_error import FileNotFound
 from ..utils.helpers import normalize_path
@@ -47,7 +47,7 @@ class DriveDAVResource():
         cache.pop(path + "/", None)
 
         # 清理父目录
-        parent = os.path.dirname(path) or "/"
+        parent = posixpath.dirname(path) or "/"
         cache.pop(parent, None)
         cache.pop(parent + "/", None)
 

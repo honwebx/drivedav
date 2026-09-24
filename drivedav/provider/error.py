@@ -48,6 +48,8 @@ class DavUploadHandle:
     __slots__ = ("_handle",)
 
     def __init__(self, handle):
+        if handle is None:
+            raise ValueError("上传句柄不能为空")
         self._handle = handle
 
     def write(self, data):
@@ -63,4 +65,8 @@ class DavUploadHandle:
             raise error_to_dav(e)
 
     def __getattr__(self, name):
-        return getattr(self._handle, name)
+        try:
+            handle = object.__getattribute__(self, "_handle")
+        except AttributeError:
+            raise AttributeError(f"{type(self).__name__!r} 未初始化") from None
+        return getattr(handle, name)

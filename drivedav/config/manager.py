@@ -1,4 +1,5 @@
 import os
+import tempfile
 import tomli_w
 from typing import TYPE_CHECKING, Optional
 
@@ -39,16 +40,28 @@ class GlobalConfigManager:
         if not os.path.exists(self._config_file):
             return ""
         with open(self._config_file, "r", encoding="utf-8") as f:
-            return f.read().strip()
+            return f.read()
 
     def _write_raw(self, text: str):
         """
         写入原始配置
         """
 
-        os.makedirs(os.path.dirname(self._config_file), exist_ok=True)
-        with open(self._config_file, "w", encoding="utf-8") as f:
-            f.write(text)
+        directory = os.path.dirname(self._config_file)
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=directory, prefix=".drivedav.", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, self._config_file)
+        except BaseException:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
 
     def is_encrypted(self) -> bool:
         """
@@ -56,26 +69,37 @@ class GlobalConfigManager:
         """
 
         text = self._read_raw()
-        return text.startswith(self._marker)
+        return text.strip().startswith(self._marker)
 
     def load_full(self) -> dict:
         """
         加载完整配置
         """
 
-        raw = self._read_raw()
+        raw = self._read_raw().strip()
         if not raw:
             return {}
 
-        if self._enable_encrypt:
+        encrypted = raw.startswith(self._marker)
+        if self._enable_encrypt or encrypted:
+            if not encrypted:
+                print("读取配置失败：文件未加密")
+                return {}
+            if self._crypto is None:
+                print("读取配置失败：未提供解密密码")
+                return {}
             raw = self._strip_marker(raw)
             try:
                 raw = self._crypto.decrypt(raw)
-            except ValueError as e:
+            except (ValueError, TypeError) as e:
                 print(f"读取配置失败：{e}")
                 return {}
 
-        return tomllib.loads(raw)
+        try:
+            return tomllib.loads(raw)
+        except Exception as e:
+            print(f"读取配置失败：配置文件损坏（{e}）")
+            return {}
 
     def save_full(self, data: dict):
         """
@@ -84,6 +108,8 @@ class GlobalConfigManager:
 
         text = tomli_w.dumps(data)
         if self._enable_encrypt:
+            if self._crypto is None:
+                raise ValueError("未提供加密密码，无法保存加密配置")
             text = self._crypto.encrypt(text)
             text = self._add_marker(text)
         
@@ -123,8 +149,10 @@ class SectionConfig:
 
         cur = data
         for k in self._keys:
+            if not isinstance(cur, dict):
+                return {}
             cur = cur.get(k, {})
-        return cur
+        return cur if isinstance(cur, dict) else {}
 
     def _set_nested(self, data: dict, value: dict):
         """
@@ -133,7 +161,11 @@ class SectionConfig:
 
         cur = data
         for k in self._keys[:-1]:
-            cur = cur.setdefault(k, {})
+            node = cur.setdefault(k, {})
+            if not isinstance(node, dict):
+                node = {}
+                cur[k] = node
+            cur = node
 
         cur[self._keys[-1]] = value
 

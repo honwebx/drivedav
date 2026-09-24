@@ -2,6 +2,7 @@ import errno
 import traceback
 import logging
 from http.client import responses
+from xml.sax.saxutils import escape as xml_escape
 
 from wsgidav.error_printer import ErrorPrinter
 from wsgidav import util
@@ -101,7 +102,7 @@ class XmlErrorPrinter(ErrorPrinter):
                 yield b""
                 return
 
-            message = e.get_user_info() or str(e)
+            message = xml_escape(e.get_user_info() or str(e))
             xml = f"""<?xml version="1.0" encoding="utf-8"?>
 <d:error xmlns:d="DAV:">
     <d:message>{message}</d:message>

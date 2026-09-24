@@ -1,18 +1,32 @@
 import math
 import time
 import requests
+from typing import Callable, Optional
 from ...core.drive_upload_handle import DriveUploadHandle
 from .error import AlipanError
 
 _CHUNK_SIZE = 4 * 1024 * 1024
-_UPLOAD_URL_TTL = 3600
+_UPLOAD_URL_TTL = 1800
+_URL_PREFETCH = 5
+_MAX_RETRIES = 3
+_RETRY_BACKOFF = (0.5, 1.0, 2.0)
+_PUT_TIMEOUT = (15, 120)
 
 
 class AlipanUploadHandle(DriveUploadHandle):
 
-    def __init__(self, api, parent_file_id, file_name, file_size=None):
+    def __init__(
+        self,
+        api,
+        parent_file_id: str,
+        file_name: str,
+        file_size: Optional[int] = None,
+        finalize: Optional[Callable[[str], None]] = None,
+    ):
         self._api = api
         self._file_size = file_size
+        self._finalize = finalize
+        self._oss_session = requests.Session()
 
         part_info_list = None
         if file_size:
@@ -24,93 +38,143 @@ class AlipanUploadHandle(DriveUploadHandle):
             name=file_name,
             size=file_size,
             part_info_list=part_info_list,
+            check_name_mode="auto_rename",
         )
         self._file_id = create_resp["file_id"]
         self._upload_id = create_resp.get("upload_id")
-        self._exist = create_resp.get("exist", False)
-        self._rapid_upload = create_resp.get("rapid_upload", False)
-        self._aborted = self._exist or self._rapid_upload or not self._upload_id
+        self._exist = bool(create_resp.get("exist", False))
+        
+        self._active = bool(self._upload_id) and not self._exist
 
-        self._part_urls = {}
-        for part in create_resp.get("part_info_list") or []:
-            self._part_urls[part["part_number"]] = part["upload_url"]
-
-        self._urls_created_at = time.time()
+        self._part_urls: dict[int, str] = {}
+        self._urls_created_at = 0.0
+        self._cache_part_urls(create_resp.get("part_info_list") or [])
 
         self._part_number = 1
         self._buffer = bytearray()
+        self._failed = False
+
+    def _cache_part_urls(self, parts):
+        for part in parts:
+            self._part_urls[part["part_number"]] = part["upload_url"]
+        if parts:
+            self._urls_created_at = time.time()
 
     def _get_part_url(self, part_number: int) -> str:
         """
-        获取分片上传地址
+        获取分片上传地址。
+        命中且未过期则直接复用；否则批量预取 [_URL_PREFETCH] 个分片 URL，
+        减少限流 API（getUploadUrl）的调用次数。
         """
 
-        url = self._part_urls.pop(part_number, None)
-        if url and time.time() - self._urls_created_at < _UPLOAD_URL_TTL:
-            return url
+        if part_number in self._part_urls and time.time() - self._urls_created_at < _UPLOAD_URL_TTL:
+            return self._part_urls.pop(part_number)
+
+        start = part_number
+        end = part_number + _URL_PREFETCH
+        if self._file_size:
+            total = math.ceil(self._file_size / _CHUNK_SIZE)
+            end = min(end, total + 1)
 
         resp = self._api.get_upload_url(
             file_id=self._file_id,
             upload_id=self._upload_id,
-            part_numbers=[part_number],
+            part_numbers=list(range(start, end)),
         )
-        parts = resp.get("part_info_list") or []
-        if parts:
-            return parts[0]["upload_url"]
-        raise Exception(f"无法获取分片{part_number}的上传URL")
+        self._cache_part_urls(resp.get("part_info_list") or [])
+
+        if part_number not in self._part_urls:
+            raise AlipanError.convert(400, "UploadUrlUnavailable", f"无法获取分片 {part_number} 的上传 URL")
+        return self._part_urls.pop(part_number)
 
     def _upload_part(self, part_number: int, data: bytes):
         """
-        上传分片
+        上传分片。
+        对可重试错误（网络错误、5xx、408、429、403[预签名 URL 过期可经
+        getUploadUrl 恢复]）按指数退避重试 [_MAX_RETRIES] 次，
+        仍失败才标记失败并抛出；其他 4xx 立即放弃。
         """
 
-        try:
-            upload_url = self._get_part_url(part_number)
-            resp = requests.put(upload_url, data=data)
-            resp.raise_for_status()
-        except requests.RequestException as e:
-            self._abort()
-            raise AlipanError.parse_response(getattr(e, "response", None), e) from e
-        except Exception as e:
-            self._abort()
-            raise
+        last_err = None
+        for attempt in range(_MAX_RETRIES + 1):
+            try:
+                upload_url = self._get_part_url(part_number)
+                resp = self._oss_session.put(upload_url, data=data, timeout=_PUT_TIMEOUT)
+                resp.raise_for_status()
+                return
+            except requests.RequestException as e:
+                last_err = e
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                retriable = status is None or status >= 500 or status in (408, 429, 403)
+                if not retriable or attempt >= _MAX_RETRIES:
+                    break
+                if status == 403:
+                    # 预签名 URL 过期：丢弃该分片缓存 URL，重试时强制重取
+                    self._part_urls.pop(part_number, None)
+                time.sleep(_RETRY_BACKOFF[min(attempt, len(_RETRY_BACKOFF) - 1)])
+            except Exception:
+                self._failed = True
+                raise
+
+        self._failed = True
+        raise AlipanError.parse_response(getattr(last_err, "response", None), last_err) from last_err
 
     def write(self, data: bytes):
         """
-        写入数据到缓冲区，当缓冲区达到 CHUNK_SIZE 时自动上传
+        写入数据到缓冲区，当缓冲区达到 [_CHUNK_SIZE] 时自动上传分片。
+        用偏移量批量消费，避免每次 del 前缀的 O(n²) memmove 开销。
         """
 
-        if self._aborted:
+        if not self._active or self._failed:
             return
 
         self._buffer.extend(data)
 
-        while len(self._buffer) >= _CHUNK_SIZE:
-            chunk = bytes(self._buffer[:_CHUNK_SIZE])
-            del self._buffer[:_CHUNK_SIZE]
+        offset = 0
+        while len(self._buffer) - offset >= _CHUNK_SIZE:
+            chunk = bytes(self._buffer[offset:offset + _CHUNK_SIZE])
+            offset += _CHUNK_SIZE
             self._upload_part(self._part_number, chunk)
             self._part_number += 1
+        if offset:
+            del self._buffer[:offset]
 
     def close(self):
         """
-        完成上传
-        上传剩余数据并通知服务器合并文件
+        完成上传：上传剩余分片、合并文件、执行 finalize 回调（替换旧文件）。
+        只要创建了新文件（not _exist）就执行 finalize，不依赖 _active；
+        任何异常均标记失败并抛出，finally 保证本地资源清理。
         """
 
-        if self._aborted:
+        if self._failed:
+            self._cleanup()
             return
 
-        if self._buffer:
-            self._upload_part(self._part_number, bytes(self._buffer))
+        try:
+            if self._active:
+                if self._buffer:
+                    self._upload_part(self._part_number, bytes(self._buffer))
+                self._api.complete_upload(self._file_id, self._upload_id)
+            if not self._exist and self._finalize:
+                self._finalize(self._file_id)
+        except Exception:
+            self._failed = True
+            raise
+        finally:
+            self._cleanup()
 
-        self._api.complete_upload(self._file_id, self._upload_id)
-        self._abort()
+    def _cleanup(self):
+        """
+        清理本地资源（缓冲区、OSS 连接）。
+        上传失败且已创建服务端上传会话时，尝试 cancel 残留上传
+        （失败不抛，仅尽力清理，避免阻塞本地资源释放）。
+        """
 
-    def _abort(self):
-        """
-        上传失败
-        清理资源
-        """
-        
-        self._aborted = True
+        try:
+            if self._failed and self._active and self._upload_id:
+                self._api.cancel_upload(self._file_id, self._upload_id)
+        except Exception:
+            pass
+
         self._buffer.clear()
+        self._oss_session.close()

@@ -75,7 +75,7 @@ class DriveDAVProvider(DAVProvider):
         path = normalize_path(path)
 
         if is_invalid_path(path):
-            return None
+            raise DAVError(HTTP_BAD_REQUEST)
 
         meta = self._load_meta(path, environ)
         if meta:

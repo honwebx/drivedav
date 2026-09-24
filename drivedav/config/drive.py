@@ -18,7 +18,7 @@ class DriveConfig:
         加载 Drive 配置
         """
 
-        data = self._view.load()
+        data = dict(self._view.load())
         data.pop("type", None)
 
         return data
@@ -27,10 +27,11 @@ class DriveConfig:
         """
         保存 Drive 配置
         """
-        
+
         old = self._view.load()
+        data = dict(data)
         data.pop("type", None)
         if "type" in old:
             data["type"] = old["type"]
-            
+
         return self._view.save(data)

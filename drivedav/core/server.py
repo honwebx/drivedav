@@ -9,6 +9,27 @@ from ..config.wsgidav import wsgi_config
 
 PID_FILE = os.path.join(tempfile.gettempdir(), "drivedav.pid")
 
+def _write_pid_file():
+    fd = os.open(PID_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    try:
+        os.write(fd, str(os.getpid()).encode())
+    finally:
+        os.close(fd)
+
+def _remove_pid_file():
+    try:
+        os.remove(PID_FILE)
+    except OSError:
+        pass
+
+def _read_pid():
+    try:
+        with open(PID_FILE) as f:
+            pid = int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
 def run():
     config = wsgi_config()
     if not config:
@@ -35,58 +56,78 @@ def start_server():
     """
     启动DriveDAV服务器
     """
-    
-    with open(PID_FILE, "w") as f:
-        f.write(str(os.getpid()))
-    run()
+
+    if check_server_status():
+        print("DriveDAV 已在运行")
+        return
+
+    try:
+        _write_pid_file()
+    except OSError as e:
+        print(f"写入 PID 文件失败: {e}")
+        return
+
+    try:
+        run()
+    finally:
+        _remove_pid_file()
 
 def stop_server():
     """
     停止DriveDAV服务器
     """
 
-    if not os.path.exists(PID_FILE):
+    pid = _read_pid()
+    if pid is None:
+        _remove_pid_file()
         print("DriveDAV 没有运行")
         return
 
-    with open(PID_FILE) as f:
-        pid = int(f.read())
-
     try:
         os.kill(pid, signal.SIGTERM)
-        print(f"正在关闭 DriveDAV...")
-        expires_at = time.time() + 3
-        while True:
-            if not check_server_status():
-                break
-
-            if time.time() >= expires_at:
-                os.kill(pid, signal.SIGKILL)
-                break
-        
-            time.sleep(0.1)
-
-        print(f"已停止 DriveDAV (PID {pid})")
     except ProcessLookupError:
         print("进程不存在")
-    finally:
-        if not check_server_status() and os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        _remove_pid_file()
+        return
+    except OSError as e:
+        print(f"停止失败：{e}")
+        return
+
+    print("正在关闭 DriveDAV...")
+    expires_at = time.time() + 3
+    force_killed = False
+    while True:
+        if not check_server_status():
+            break
+        if time.time() >= expires_at:
+            if force_killed:
+                break
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                break
+            force_killed = True
+            expires_at = time.time() + 2
+        time.sleep(0.1)
+
+    if check_server_status():
+        print(f"停止失败，进程仍在运行 (PID {pid})")
+        return
+
+    _remove_pid_file()
+    print(f"已停止 DriveDAV (PID {pid})")
 
 def status_server():
     """
     输出DriveDAV服务器状态
     """
 
-    if not os.path.exists(PID_FILE):
-        print("DriveDAV 没有运行")
-        return
-
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read())
-    except (OSError, ValueError):
-        print("PID 文件损坏或无法读取")
+    pid = _read_pid()
+    if pid is None:
+        if not os.path.exists(PID_FILE):
+            print("DriveDAV 没有运行")
+        else:
+            print("PID 文件损坏或无法读取")
         return
 
     try:
@@ -102,17 +143,12 @@ def check_server_status():
     检查DriveDAV服务器状态
     """
 
-    if not os.path.exists(PID_FILE):
-        return False
-
-    try:
-        with open(PID_FILE) as f:
-            pid = int(f.read())
-    except (OSError, ValueError):
+    pid = _read_pid()
+    if pid is None:
         return False
 
     try:
         os.kill(pid, 0)
         return True
-    except:
+    except OSError:
         return False

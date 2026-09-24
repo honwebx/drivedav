@@ -78,10 +78,12 @@ class AlipanError:
 
         code = data.get("code", "UnknownError")
         message = data.get("message", str(exc))
+        # 连接级错误时 resp 为 None（如 DNS 失败、连接被拒），resp.headers 可能不存在
+        headers = getattr(resp, "headers", None) or {}
         request_id = (
             data.get("requestId")
             or data.get("request_id")
-            or resp.headers.get("x-ca-request-id")
+            or headers.get("x-ca-request-id")
             or "" )
 
         return cls.convert(status, code, message, request_id)

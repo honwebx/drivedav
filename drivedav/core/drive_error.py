@@ -25,5 +25,6 @@ class DriveError(Exception):
 class FileNotFound(DriveError): pass
 class TokenExpired(DriveError): pass
 class RateLimitExceeded(DriveError): pass
+class RangeNotSatisfiable(DriveError): pass
 class PermissionDenied(DriveError): pass
 class ServiceUnavailable(DriveError): pass

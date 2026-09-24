@@ -16,14 +16,14 @@ class AlipanAPI:
         self._throttler = Throttler()
     
     @staticmethod
-    def _filter_data(data: dict[str]) -> dict:
+    def _filter_data(data: dict[str, Any]) -> dict:
         """
         过滤资源数据字段，只保留指定的字段
         """
 
         fields = {"file_id", "parent_file_id", "name", "type", "size", "file_extension", "mime_type", "content_hash", "created_at", "updated_at"}
 
-        return {k: data.get(k) for k in fields if k in data}
+        return {k: data.get(k) for k in fields}
 
     def _request(self, method, url, **kwargs)-> dict[str, Any]:
         self._throttler.wait()
@@ -32,13 +32,10 @@ class AlipanAPI:
         headers = kwargs.pop("headers", {}) or {}
         headers["Content-Type"] = "application/json"
         headers["Authorization"] = f"Bearer {access_token}"
-        
-        try:
-            resp = self._session.request(method, url, headers=headers, **kwargs)
-            if resp.status_code == 400:
-                if "PreHashMatched" == resp.json().get("code"):
-                    return resp.json()
+        timeout = kwargs.pop("timeout", (10, 30))
 
+        try:
+            resp = self._session.request(method, url, headers=headers, timeout=timeout, **kwargs)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise AlipanError.parse_response(getattr(e, "response", None), e)
@@ -106,11 +103,10 @@ class AlipanAPI:
         file_meta = self.get_by_path(file_path)
         return file_meta.get("file_id")
 
-    def get_download_url(self, file_id: str, headers: dict[str, str] = None, expire_sec: int = 900) -> str:
+    def get_download_url(self, file_id: str, expire_sec: int = 900) -> str:
         """
         获取文件下载链接
         file_id: 文件 ID
-        range_header: 范围请求头（可选）
         expire_sec: 过期时间（秒）
         """
 
@@ -122,9 +118,12 @@ class AlipanAPI:
             "expire_sec": expire_sec,
         }
 
-        result = self._request("POST", url, json=body, headers=headers)
+        result = self._request("POST", url, json=body)
 
-        return result["url"]
+        url = result.get("url")
+        if not url:
+            raise AlipanError.convert(404, "NotFound.File", "无法获取下载链接", "")
+        return url
 
     def trash(self, file_id: str) -> dict:
         """
@@ -152,15 +151,11 @@ class AlipanAPI:
         size: int = None,
         type: str = "file",
         check_name_mode: str = "refuse",
-        pre_hash: str = None,
-        content_hash: str = None,
-        content_hash_name: str = "sha1",
-        proof_code: str = None,
-        proof_version: str = None,
         part_info_list: list = None,
     ):
         """
-        创建文件（支持秒传 + 分片上传）
+        创建文件（分片上传）
+        pre_hash/content_hash/proof_code 相关参数，每次均为完整分片上传。
         """
 
         url = f"{self._api_url}/adrive/v1.0/openFile/create"
@@ -173,19 +168,8 @@ class AlipanAPI:
             "check_name_mode": check_name_mode,
         }
 
-        # 秒传参数
         if size:
             body["size"] = size
-        if pre_hash:
-            body["pre_hash"] = pre_hash
-        if content_hash:
-            body["content_hash"] = content_hash
-        if content_hash_name:
-            body["content_hash_name"] = content_hash_name
-        if proof_code:
-            body["proof_code"] = proof_code
-        if proof_version:
-            body["proof_version"] = proof_version
 
         # 分片参数
         if part_info_list:
@@ -201,6 +185,23 @@ class AlipanAPI:
             "rapid_upload": result.get("rapid_upload"),
             "part_info_list": result.get("part_info_list", []),
         }
+
+    def cancel_upload(self, file_id: str, upload_id: str):
+        """
+        取消未完成的上传，清理服务端残留。
+        file_id: 文件 ID
+        upload_id: 上传会话 ID
+        """
+
+        url = f"{self._api_url}/adrive/v1.0/openFile/cancel"
+
+        body = {
+            "drive_id": self._drive_id,
+            "file_id": file_id,
+            "upload_id": upload_id,
+        }
+
+        self._request("POST", url, json=body)
 
     def get_upload_url(self, file_id: str, upload_id: str, part_numbers: list):
         """
@@ -351,4 +352,5 @@ class AlipanAPI:
 
         result = self._request("POST", url, json=body)
 
-        return result.get("state") == "Succeed"
+        state = (result.get("state") or "").strip()
+        return state in ("Succeed", "Success")

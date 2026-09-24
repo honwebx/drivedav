@@ -35,7 +35,7 @@ def wsgi_config():
 
     wsgi_cfg = {
         "server": "cheroot",
-        "host": "0.0.0.0",
+        "host": "127.0.0.1",
         "port": 8080,
         "provider_mapping": {},
         "http_authenticator": {
@@ -61,19 +61,30 @@ def wsgi_config():
     all_drives = global_cfg.get("drive", {})
     if all_drives:
         for name, item in all_drives.items():
-            drive_type = item.get("type")
+            drive_type = item.get("type") if isinstance(item, dict) else None
+            if not drive_type:
+                print(f"跳过网盘 '{name}'：配置缺少类型")
+                continue
             try:
                 module = importlib.import_module(f"..drives.{drive_type}", package=__package__)
-                drive_config = DriveConfig(global_manager, name)
-                provider = DriveDAVProvider(module.Backend(drive_config))
-                wsgi_cfg["provider_mapping"][f"/{name}"] = provider
             except ModuleNotFoundError:
+                print(f"跳过网盘 '{name}'：类型不可用 '{drive_type}'")
                 continue
+            drive_config = DriveConfig(global_manager, name)
+            provider = DriveDAVProvider(module.Backend(drive_config))
+            wsgi_cfg["provider_mapping"][f"/{name}"] = provider
     else:
         return None
 
+    if not wsgi_cfg["provider_mapping"]:
+        return None
+
     dav_cfg = global_cfg.get("dav", {})
+    if not isinstance(dav_cfg, dict):
+        dav_cfg = {}
     dav_server = dav_cfg.get("server")
+    if not isinstance(dav_server, dict):
+        dav_server = {}
     if dav_server:
         if dav_server.get("host"):
             wsgi_cfg["host"] = dav_server["host"]
@@ -87,6 +98,8 @@ def wsgi_config():
                 "password": dav_user.get("password"),
             }
         }
+    else:
+        print("警告：未配置 WebDAV 用户，匿名可访问服务")
 
     dav_ssl = dav_cfg.get("ssl")
     if dav_ssl:

@@ -1,4 +1,5 @@
 from wsgidav.dav_provider import DAVCollection
+from wsgidav.dav_error import DAVError, HTTP_BAD_REQUEST
 from .resource import DriveDAVResource
 from .error import error_to_dav
 from urllib.parse import unquote
@@ -28,14 +29,16 @@ class DriveDAVCollection(DriveDAVResource, DAVCollection):
 
         return lst or []
 
-    def get_member(self, name: str) -> DriveDAVResource:
+    def get_member(self, name: str) -> DriveDAVResource | None:
         """
         根据名称获取成员
         name: 成员名称
         """
 
-        assert '/' not in name[:-1]
-        child_path = self._path + name
+        if not name or "/" in name[:-1] or name in (".", ".."):
+            return None
+        base_path = self._path if self._path.endswith("/") else self._path + "/"
+        child_path = base_path + name
 
         return self._provider.get_resource_inst(child_path, self._environ)
 
@@ -60,9 +63,11 @@ class DriveDAVCollection(DriveDAVResource, DAVCollection):
         name: 集合名称
         """
 
-        assert "/" not in name
-        collection_path = self._path + name + "/"
-        
+        if not name or "/" in name or name in (".", ".."):
+            raise DAVError(HTTP_BAD_REQUEST)
+        base_path = self._path if self._path.endswith("/") else self._path + "/"
+        collection_path = base_path + name + "/"
+
         try:
             self._ensure_parents(collection_path)
             self._drive.make_dir(collection_path)
@@ -77,9 +82,11 @@ class DriveDAVCollection(DriveDAVResource, DAVCollection):
         创建空文件
         name: 文件名称
         """
-        
-        assert "/" not in name
-        file_path = self._path + name
+
+        if not name or "/" in name or name in (".", ".."):
+            raise DAVError(HTTP_BAD_REQUEST)
+        base_path = self._path if self._path.endswith("/") else self._path + "/"
+        file_path = base_path + name
         self._invalidate_meta(file_path)
-        
+
         return self._provider.get_resource_inst(file_path, self._environ)

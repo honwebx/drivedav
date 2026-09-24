@@ -119,7 +119,13 @@ class AlipanOAuth():
             raise AlipanError.parse_response(getattr(e, "response", None), e)
 
         j = resp.json()
-        self._token_info["drive_id"] = j["backup_drive_id"]
+        # 备份盘缺失时回退默认盘/资源盘（resource-drive-only 账号无 backup_drive_id）
+        drive_id = (
+            j.get("backup_drive_id")
+            or j.get("default_drive_id")
+            or j.get("resource_drive_id")
+        )
+        self._token_info["drive_id"] = drive_id
         
         return self._token_info["drive_id"]
 
