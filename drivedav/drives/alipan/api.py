@@ -37,10 +37,12 @@ class AlipanAPI:
         try:
             resp = self._session.request(method, url, headers=headers, timeout=timeout, **kwargs)
             resp.raise_for_status()
+            # 2xx 但 body 非 JSON（如网关注入 HTML）时 resp.json() 抛
+            # requests.JSONDecodeError（属 RequestException）：一并进错误映射，
+            # 不抛裸异常，避免 provider 包成无上下文 500。
+            return resp.json()
         except requests.RequestException as e:
             raise AlipanError.parse_response(getattr(e, "response", None), e)
-
-        return resp.json()
 
     def list_files(self, parent_file_id: str) -> list[dict[str, Any]]:
         """
@@ -315,11 +317,12 @@ class AlipanAPI:
             "async_task_id": result.get("async_task_id", ""),
         }
 
-    def copy(self, file_id: str, to_parent_file_id: str, auto_rename: bool = False):
+    def copy(self, file_id: str, to_parent_file_id: str, new_name: str = None, auto_rename: bool = False):
         """
         复制资源
         file_id: 文件 ID
         to_parent_file_id: 目标父文件夹 ID
+        new_name: 新名称（可选，未指定则沿用源名）
         auto_rename: 是否自动重命名（可选）
         """
 
@@ -331,6 +334,9 @@ class AlipanAPI:
             "to_parent_file_id": to_parent_file_id,
             "auto_rename": auto_rename,
         }
+
+        if new_name:
+            body["new_name"] = new_name
 
         result = self._request("POST", url, json=body)
 

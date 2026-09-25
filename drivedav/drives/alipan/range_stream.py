@@ -140,12 +140,11 @@ class RangeStream:
                         raise mapped from e
                     raise self._map_http_error(e.response, e) from e
                 last_exc = e
-                # 连接层失败：先 close session 驱逐池中毒化的半死连接
-                # （只清闲置池连接，不掐其他流正在传的连接），再退避重试。
-                try:
-                    self._session.close()
-                except Exception:
-                    pass
+                # 连接层失败：直接退避重试，不动共享 session——
+                # urllib3 池会自动丢弃建连失败的坏连接，而 Session.close()
+                # 会关闭共享池里所有连接（含其他并发流正在用的），注释里
+                # “只清闲置池” 的假设并不成立。
+                self._close_resp()
         # 错误消息不带 str(last_exc)：其 URL 部分含 OSS 签名查询串
         raise ServiceUnavailable(
             "CDNConnectFailed",

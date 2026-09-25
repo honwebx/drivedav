@@ -8,6 +8,7 @@ from ...utils.cache import Cache
 from ...utils.helpers import to_utc_timestamp
 from ...core.drive_backend import DriveBackend
 from .error import AlipanError, FileNotFound, PermissionDenied, ServiceUnavailable
+from ...core.drive_error import DriveError
 from .oauth import AlipanOAuth
 from .api import AlipanAPI
 from .range_stream import RangeStream
@@ -34,6 +35,13 @@ class AlipanBackend(DriveBackend):
         # token 刷新临界区锁：多线程共享一个后端实例，check-then-refresh 必须串行，
         # 否则两个线程同时用旧 RT 刷新会被 Aliyun 轮换机制作废其中一个（间歇 401）。
         self._token_lock = threading.Lock()
+        # finalize 串行锁（按目标路径）：rclone 批量覆盖 / 重试并发 PUT 同一路径时，
+        # 各自 finalize 的 trash→rename 链必须串行，否则第二个 finalize 会回收
+        # 已被第一个 finalize 送进回收站的旧 file_id → 404 NotFound.FileId。
+        # _finalize_locks[path] = (lock, refcount)：引用计数，计数归零时从
+        # 字典移除，避免长驻服务累积无界增长。计数增减与锁获取/释放配对进行。
+        self._finalize_locks: dict[str, tuple[threading.Lock, int]] = {}
+        self._finalize_locks_guard = threading.Lock()
         self._api = AlipanAPI(self._cfg.get("drive_id"), self._refresh_token)
         self._oauth = AlipanOAuth(self._cfg.get("app_id"), self._cfg.get("app_secret"))
         # 数据面 CDN 会话：复用 TLS 连接，与控制面 session（AlipanAPI 内）分离。
@@ -70,16 +78,15 @@ class AlipanBackend(DriveBackend):
         """
         获取访问令牌。
         如果令牌过期，自动刷新令牌。
-        多线程并发时经 _token_lock 串行（双重检查），避免同时用旧 RT
-        刷新被 Aliyun 轮换机制判定失效；save 失败不抛（内存已更新，
-        当前会话不受影响，仅重启后需重新刷新）。
+        全程经 _token_lock 串行：_cfg 里 expires_at 与 access_token 分 key
+        存储，锁外快路径+锁内二次检查的双重检查模式会在 writer update()
+        中途读到新旧混搭（旧 token + 新过期时间 → 返回刚被轮换的旧
+        token）。控制面请求本来就被 Throttler 串行在 200ms 间隔，
+        无竞争锁开销可忽略，直接一次上锁，读/写都原子。
+        save 失败不抛（内存已更新，当前会话不受影响，仅重启后需重新刷新）。
         """
 
-        if time.time() <= float(self._cfg.get("expires_at", 0) or 0) - 60:
-            return self._cfg.get("access_token")
-
         with self._token_lock:
-            # 二次检查：另一线程可能已刷新
             if time.time() <= float(self._cfg.get("expires_at", 0) or 0) - 60:
                 return self._cfg.get("access_token")
 
@@ -346,29 +353,102 @@ class AlipanBackend(DriveBackend):
             dst_parent_file_id,
             file_name,
             file_size,
-            finalize=lambda new_id: self._finalize_upload(
-                new_id, old_file_id, file_name, dst_path, dst_parent_path
+            finalize=lambda new_id, complete_meta=None: self._finalize_upload(
+                new_id, old_file_id, file_name, dst_path, dst_parent_path, complete_meta
             ),
         )
 
         return upload_handle
 
-    def _finalize_upload(self, new_file_id, old_file_id, file_name, dst_path, parent_path):
+    def _finalize_lock(self, path: str) -> tuple[threading.Lock, callable]:
         """
-        上传成功后替换旧文件：删除旧文件 → 等待异步任务 → 重命名新文件回原名 → 失效缓存。
-        无旧文件时跳过删除与重命名，仅失效缓存。
+        取（或建）path 的 finalize 串行锁，并把引用计数 +1。
+        返回 (lock, release)：调用方 with lock 结束后必须调 release()，
+        计数归零时把锁从字典移除，防止无界增长。
         """
 
-        if old_file_id:
-            result = self._api.trash(old_file_id)
-            async_task_id = result.get("async_task_id")
-            if async_task_id:
-                self._wait_async_task(async_task_id)
-            self._api.rename(new_file_id, file_name)
+        with self._finalize_locks_guard:
+            entry = self._finalize_locks.get(path)
+            if entry is None:
+                entry = (threading.Lock(), 0)
+            lock, refcount = entry
+            self._finalize_locks[path] = (lock, refcount + 1)
 
-        self._cache.delete(dst_path)
-        self._cache.delete(f"dl_{dst_path}")
-        self._cache.delete(f"lst_{parent_path}")
+        def release():
+            with self._finalize_locks_guard:
+                entry = self._finalize_locks.get(path)
+                if entry is None:
+                    return
+                lock, refcount = entry
+                refcount -= 1
+                if refcount <= 0:
+                    self._finalize_locks.pop(path, None)
+                else:
+                    self._finalize_locks[path] = (lock, refcount)
+
+        return lock, release
+
+    def _finalize_upload(self, new_file_id, old_file_id, file_name, dst_path, parent_path, complete_meta=None):
+        """
+        上传成功后替换旧文件：删除当前占用者 → 等待异步任务 → 重命名新文件回原名 → 回填缓存。
+        无旧文件时跳过删除与重命名，用 complete 的权威 meta 回填缓存。
+
+        缓存回填而非删除：rclone 上传后立刻 PROPFIND 校验 size；若删缓存，
+        校验回源 get_by_path 会撞上阿里云 complete/rename 后的读后写延迟，
+        读到 size=0 误报 corrupted。这里用 complete/rename 接口自己返回的
+        权威 meta（含正确 size）直接回填，让校验走缓存、绕开延迟窗口。
+
+        删的是 finalize 时刻重查到的“当前占用者”而非 open_writer 时的快照：
+        并发 PUT/重试场景下快照 id 可能已被其他 finalize 送进回收站，
+        用快照 trash 必得 404 NotFound.FileId；用刚查到的新鲜 id trash 则
+        不会 404（中途被删则 FileNotFound 按“删除已达成”继续 rename 回填）。
+        同路径 finalize 经 _finalize_lock 串行，保证“查占用→删→改名”
+        原子，形成 last-writer-wins；rename 报 FileNotFound（新文件 id
+        不可用）属真实失败，原样抛出由 provider 转成 404 给客户端。
+        """
+
+        lock, release = self._finalize_lock(dst_path)
+        try:
+            with lock:
+                rename_meta = None
+                if old_file_id:
+                    try:
+                        fresh = self._api.get_by_path(dst_path)
+                        occupant_id = (fresh or {}).get("file_id")
+                    except FileNotFound:
+                        occupant_id = None
+                    except DriveError:
+                        # 重查失败（限流/网络抖动）则回退用快照 id 尝试，
+                        # 404 仍由下层 except FileNotFound 兜住。
+                        occupant_id = old_file_id
+
+                    if occupant_id and occupant_id != new_file_id:
+                        try:
+                            result = self._api.trash(occupant_id)
+                        except FileNotFound:
+                            # 刚查到、转眼被删（其他客户端并发删除）：
+                            # 等价于删除已完成，继续 rename 回填。
+                            pass
+                        else:
+                            async_task_id = result.get("async_task_id")
+                            if async_task_id:
+                                self._wait_async_task(async_task_id)
+                    # occupant 为 None（路径已空）或 occupant 就是本次新文件
+                    # （重复 finalize）：跳过 trash，直接 rename 回填。
+                    # rename 返回值是服务端权威的改名后 meta，用于回填。
+                    rename_meta = self._api.rename(new_file_id, file_name)
+
+                # 有旧文件用 rename 权威 meta；全新上传用 complete 权威 meta。
+                # 任一缺失（不应发生）才退化为删缓存（回源重查）。
+                fresh_meta = rename_meta if old_file_id else complete_meta
+                if fresh_meta:
+                    self._cache.set(dst_path, AlipanBackend._parse_meta(fresh_meta))
+                else:
+                    self._cache.delete(dst_path)
+                self._cache.delete(f"dl_{dst_path}")
+                self._cache.delete(f"lst_{parent_path}")
+        finally:
+            release()
 
     def delete(self, path: str):
         """
@@ -413,6 +493,7 @@ class AlipanBackend(DriveBackend):
         self._cache.delete(f"lst_{parent_path}")
 
         self._cache.delete(dst_path)
+        self._cache.delete(f"dl_{dst_path}")
         self._cache.delete(f"lst_{dst_parent_path}")
    
     def copy(self, src_path: str, dst_path: str):
@@ -423,18 +504,21 @@ class AlipanBackend(DriveBackend):
         src_path = src_path.rstrip("/") or "/"
         dst_path = dst_path.rstrip("/") or "/"
         dst_parent_path = posixpath.dirname(dst_path) or "/"
+        dst_name = posixpath.basename(dst_path)
         src_file_id = self._api.get_file_id(src_path)
         dst_parent_file_id = self._api.get_file_id(dst_parent_path)
-        
+
         result = self._api.copy(
             file_id=src_file_id,
             to_parent_file_id=dst_parent_file_id,
+            new_name=dst_name,
         )
 
         async_task_id = result.get("async_task_id")
         self._wait_async_task(async_task_id)
         
         self._cache.delete(dst_path)
+        self._cache.delete(f"dl_{dst_path}")
         self._cache.delete(f"lst_{dst_parent_path}")
 
     def _wait_async_task(self, async_task_id: str):

@@ -21,7 +21,7 @@ class AlipanUploadHandle(DriveUploadHandle):
         parent_file_id: str,
         file_name: str,
         file_size: Optional[int] = None,
-        finalize: Optional[Callable[[str], None]] = None,
+        finalize: Optional[Callable[[str, Optional[dict]], None]] = None,
     ):
         self._api = api
         self._file_size = file_size
@@ -142,8 +142,8 @@ class AlipanUploadHandle(DriveUploadHandle):
     def close(self):
         """
         完成上传：上传剩余分片、合并文件、执行 finalize 回调（替换旧文件）。
-        只要创建了新文件（not _exist）就执行 finalize，不依赖 _active；
-        任何异常均标记失败并抛出，finally 保证本地资源清理。
+        只要创建了新文件就执行 finalize（秒传命中也一样，见内联注释），
+        不依赖 _active；任何异常均标记失败并抛出，finally 保证本地资源清理。
         """
 
         if self._failed:
@@ -151,17 +151,34 @@ class AlipanUploadHandle(DriveUploadHandle):
             return
 
         try:
+            complete_meta = None
             if self._active:
                 if self._buffer:
                     self._upload_part(self._part_number, bytes(self._buffer))
-                self._api.complete_upload(self._file_id, self._upload_id)
-            if not self._exist and self._finalize:
-                self._finalize(self._file_id)
+                # complete 返回值是服务端权威的落盘 meta（含正确 size）：
+                # 透传给 finalize 做缓存回填，让上传后立即的 rclone 校验读
+                # 走缓存而非回源，绕开阿里云 complete 后的读后写延迟窗口。
+                complete_meta = self._api.complete_upload(self._file_id, self._upload_id)
+            # 只要创建了新文件就执行 finalize，不论是否秒传命中（_exist）：
+            # 秒传同样产生了带 auto_rename 名的新文件，必须 trash 旧文件 +
+            # rename 回原名，否则旧文件残留、新文件挂错名成为孤儿。
+            if self._finalize:
+                self._finalize(self._file_id, complete_meta)
         except Exception:
             self._failed = True
             raise
         finally:
             self._cleanup()
+
+    def abort(self):
+        """
+        放弃上传：标记失败并取消服务端上传会话，不做 complete/finalize。
+        对应 wsgidav do_PUT 抛错后调 end_write(with_errors=True) 的路径，
+        避免把 0 字节残留文件 finalize 成正式文件。
+        """
+
+        self._failed = True
+        self._cleanup()
 
     def _cleanup(self):
         """

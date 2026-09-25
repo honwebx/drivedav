@@ -3,6 +3,10 @@ import requests
 from urllib.parse import urlencode
 from .error import AlipanError
 
+# OAuth 端点超时（连接，读取）：直接裸 post 无超时会永久阻塞，
+# refresh_token 走服务端热路径且持有 _token_lock，必须防挂住。
+_OAUTH_TIMEOUT = (10, 30)
+
 class AlipanOAuth():
     """
     - OAuth 授权流程
@@ -52,7 +56,7 @@ class AlipanOAuth():
         }
 
         try:
-            resp = requests.post(url, json=data)
+            resp = requests.post(url, json=data, timeout=_OAUTH_TIMEOUT)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise AlipanError.parse_response(getattr(e, "response", None), e)
@@ -81,7 +85,7 @@ class AlipanOAuth():
         }
 
         try:
-            resp = requests.post(url, json=data)
+            resp = requests.post(url, json=data, timeout=_OAUTH_TIMEOUT)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise AlipanError.parse_response(getattr(e, "response", None), e)
@@ -113,7 +117,7 @@ class AlipanOAuth():
         headers["Authorization"] = f"Bearer {access_token}"
         
         try:
-            resp = requests.post(url, headers=headers)
+            resp = requests.post(url, headers=headers, timeout=_OAUTH_TIMEOUT)
             resp.raise_for_status()
         except requests.RequestException as e:
             raise AlipanError.parse_response(getattr(e, "response", None), e)
