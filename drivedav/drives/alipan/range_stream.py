@@ -84,10 +84,18 @@ class RangeStream:
         if status in (401, 403) and self._on_refresh_url is not None:
             # CDN 直链过期：刷一次直链后按当前位置重开，不消耗退避次数。
             # 刷链本身抛的错（含“已刷过仍 403”）直接上浮，不再包装。
-            # _open_fresh 的连接错误（无 .response）由调用方重试路径处理。
-            self._url = self._on_refresh_url(self)
+            # 重开后的建连失败（含刷链后仍 403）由调用方重试/映射路径处理
+            # （刷链后仍 403 会再次进本分支，此时 refreshed 守卫抛
+            # PermissionDenied 上浮）——此处只做刷链+重开，不吞新异常。
+            new_url = self._on_refresh_url(self)
+            self._url = new_url
             self._close_resp()
-            self._open_fresh()
+            headers = dict(self._headers)
+            if self._pos > 0:
+                headers["Range"] = f"bytes={self._pos}-"
+            # 重开抛出的 HTTPError 必须原样上浮（带 .response），不能包成哨兵：
+            # 调用方 except 分支靠 e.response 做二次映射。
+            self._open_fresh(headers)
             assert self._resp is not None
             return _RETRY_SENTINEL
         from .error import AlipanError
@@ -99,7 +107,9 @@ class RangeStream:
         按当前位置打开 CDN 连接；连接层错误退避重试后仍败抛 503。
 
         HTTP 错误（401/403/416/其他）直接经 _map_http_error 处理：
-        401/403 且有刷链 hook 时内部已刷链重开、返回哨兵，调用方继续读。
+        401/403 且有刷链 hook 时：刷链+重开一次，重开仍败（HTTPError 带
+        .response）再次映射——刷链后仍 403 走 refreshed 守卫抛
+        PermissionDenied 上浮；其他码走 AlipanError 映射。
         """
         from ...core.drive_error import ServiceUnavailable
 
@@ -116,15 +126,22 @@ class RangeStream:
                 return
             except (requests.RequestException, urllib3.exceptions.HTTPError) as e:
                 if getattr(e, "response", None) is not None:
-                    mapped = self._map_http_error(e.response, e)
-                    if mapped is _RETRY_SENTINEL:
-                        return
-                    raise mapped from e
+                    if self._is_refreshable(e.response):
+                        try:
+                            mapped = self._map_http_error(e.response, e)
+                        except (requests.RequestException, urllib3.exceptions.HTTPError) as e2:
+                            # 刷链后重开仍 HTTP 错：二次映射（守卫抛 PermissionDenied
+                            # 或 AlipanError 映射），不再回退避循环。
+                            if getattr(e2, "response", None) is not None:
+                                raise self._map_http_error(e2.response, e2) from e2
+                            raise
+                        if mapped is _RETRY_SENTINEL:
+                            return
+                        raise mapped from e
+                    raise self._map_http_error(e.response, e) from e
                 last_exc = e
                 # 连接层失败：先 close session 驱逐池中毒化的半死连接
                 # （只清闲置池连接，不掐其他流正在传的连接），再退避重试。
-                # 注意：_map_http_error 内部 _open_fresh 的连接错误也会落到
-                # 这里（同一 except），重试继续按当前位置重开，无死循环。
                 try:
                     self._session.close()
                 except Exception:
@@ -137,6 +154,11 @@ class RangeStream:
             "（rclone 会自动重试续传）",
             "",
         )
+
+    @staticmethod
+    def _is_refreshable(resp: requests.Response) -> bool:
+        status = getattr(resp, "status_code", 0) or 0
+        return status in (401, 403)
 
     def _open_fresh(self, headers: dict[str, str] | None = None):
         """单次 CDN 建连：成功则 self._resp 就绪；失败抛 requests 异常。"""
