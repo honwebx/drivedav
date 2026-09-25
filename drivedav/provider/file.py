@@ -108,9 +108,24 @@ class DriveDAVFile(DriveDAVResource, DAVNonCollection):
     def end_write(self, with_errors):
         """
         上传结束
+        with_errors=True 表示传输中途出错（wsgidav do_PUT except 路径）：
+        调 handle.abort() 取消服务端残留上传，不做 complete/finalize，
+        避免把 0 字节文件 finalize 成正式文件。
         """
 
         if not self._upload_handle:
+            return
+
+        if with_errors:
+            try:
+                abort = getattr(self._upload_handle, "abort", None)
+                if callable(abort):
+                    abort()
+                else:
+                    self._upload_handle.close()
+            finally:
+                self._upload_handle = None
+                self._invalidate_meta(self._path)
             return
 
         try:
