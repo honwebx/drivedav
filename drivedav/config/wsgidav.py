@@ -98,8 +98,6 @@ def wsgi_config():
                 "password": dav_user.get("password"),
             }
         }
-    else:
-        print("警告：未配置 WebDAV 用户，匿名可访问服务")
 
     dav_ssl = dav_cfg.get("ssl")
     if dav_ssl:
