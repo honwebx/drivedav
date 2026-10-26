@@ -11,16 +11,21 @@ def main():
         choices=["start", "stop", "restart", "status", "config", "version"],
         help="可用命令: start | stop | restart | status | config | version"
     )
+    parser.add_argument(
+        "-f", "--foreground",
+        action="store_true",
+        help="start/restart 前台运行服务器（默认后台启动）"
+    )
 
     args = parser.parse_args()
 
     if args.command == "start":
-        start_server()
+        start_server(foreground=args.foreground)
     elif args.command == "stop":
         stop_server()
     elif args.command == "restart":
         stop_server()
-        start_server()
+        start_server(foreground=args.foreground)
     elif args.command == "status":
         status_server()
     elif args.command == "config":

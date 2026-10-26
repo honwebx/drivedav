@@ -6,6 +6,7 @@ import signal
 from wsgidav.wsgidav_app import WsgiDAVApp
 from cheroot import wsgi
 from ..config.wsgidav import wsgi_config
+from ..env import LOG_FILE
 
 PID_FILE = os.path.join(tempfile.gettempdir(), "drivedav.pid")
 
@@ -30,11 +31,10 @@ def _read_pid():
         return None
     return pid if pid > 0 else None
 
-def run():
-    config = wsgi_config()
-    if not config:
-        print("启动失败，配置不存在")
-        return
+def _serve_foreground(config):
+    """
+    前台运行服务器（阻塞）
+    """
 
     app = WsgiDAVApp(config)
     server = wsgi.Server(
@@ -52,25 +52,111 @@ def run():
     finally:
         server.stop()
 
-def start_server():
+def _serve_background(config, notify_fd: int) -> int:
+    """
+    子进程内运行服务器，绑定成功后通过管道通知父进程
+    返回退出码
+    """
+
+    try:
+        app = WsgiDAVApp(config)
+        server = wsgi.Server(
+            bind_addr=(config["host"], config["port"]),
+            wsgi_app=app
+        )
+        server.prepare()
+    except Exception as e:
+        try:
+            os.write(notify_fd, f"启动失败：{e}".encode())
+        finally:
+            return 1
+
+    os.write(notify_fd, b"OK")
+
+    try:
+        server.serve()
+    finally:
+        server.stop()
+
+    return 0
+
+def _redirect_stdio(target: str):
+    """
+    重定向子进程标准输入输出
+    """
+
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+    os.dup2(fd, 0)
+    os.dup2(fd, 1)
+    os.dup2(fd, 2)
+    os.close(fd)
+
+def _start_background(config, log_enabled: bool):
+    """
+    fork子进程后台启动服务器，父进程等待结果后返回
+    """
+
+    r, w = os.pipe()
+    pid = os.fork()
+
+    if pid == 0:
+        os.close(r)
+        code = 1
+        try:
+            os.setsid()
+            _redirect_stdio(LOG_FILE if log_enabled else os.devnull)
+            _write_pid_file()
+            code = _serve_background(config, w)
+        except BaseException:
+            code = 1
+        finally:
+            _remove_pid_file()
+            os._exit(code)
+
+    os.close(w)
+    data = os.read(r, 4096)
+    os.close(r)
+
+    msg = data.decode(errors="replace")
+    if msg == "OK":
+        print(f"已在后台启动 (PID {pid})")
+    elif msg:
+        print(msg)
+    else:
+        print("启动失败：服务器进程异常退出")
+
+def start_server(foreground: bool = False):
     """
     启动DriveDAV服务器
+    默认后台启动，foreground为True时前台阻塞运行
     """
 
     if check_server_status():
         print("DriveDAV 已在运行")
         return
 
-    try:
-        _write_pid_file()
-    except OSError as e:
-        print(f"写入 PID 文件失败: {e}")
+    # 配置加载与密码提示须在fork前完成
+    result = wsgi_config()
+    if not result:
+        print("启动失败，配置无效")
         return
 
-    try:
-        run()
-    finally:
-        _remove_pid_file()
+    config, log_enabled = result
+
+    if foreground:
+        try:
+            _write_pid_file()
+        except OSError as e:
+            print(f"写入 PID 文件失败: {e}")
+            return
+
+        try:
+            _serve_foreground(config)
+        finally:
+            _remove_pid_file()
+        return
+
+    _start_background(config, log_enabled)
 
 def stop_server():
     """
