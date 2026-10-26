@@ -3,7 +3,7 @@ import importlib
 from wsgidav.http_authenticator import HTTPAuthenticator
 from wsgidav.request_resolver import RequestResolver
 from ..provider import DriveDAVProvider, XmlErrorPrinter
-from ..env import CONFIG_FILE, CONFIG_PASSWORD, LOG_LEVEL
+from ..env import CONFIG_FILE, CONFIG_PASSWORD
 from .manager import GlobalConfigManager
 from .drive import DriveConfig
 from ..utils.crypto import Crypto
@@ -13,6 +13,7 @@ from getpass import getpass
 def wsgi_config():
     """
     创建WSGI配置
+    成功返回（配置字典, 日志是否开启），失败返回None
     """
 
     if not os.path.exists(CONFIG_FILE):
@@ -36,7 +37,7 @@ def wsgi_config():
     wsgi_cfg = {
         "server": "cheroot",
         "host": "127.0.0.1",
-        "port": 8080,
+        "port": 8580,
         "provider_mapping": {},
         "http_authenticator": {
             "domain_controller": None,
@@ -55,7 +56,7 @@ def wsgi_config():
             RequestResolver,
         ],
         # "numthreads": 1,
-        "verbose": LOG_LEVEL, # 日志级别：0-5
+        "verbose": 0,
     }
 
     all_drives = global_cfg.get("drive", {})
@@ -104,5 +105,9 @@ def wsgi_config():
         wsgi_cfg["ssl_certificate"] = dav_ssl.get("ssl_certificate")
         wsgi_cfg["ssl_private_key"] = dav_ssl.get("ssl_private_key")
 
-    return wsgi_cfg
+    log_cfg = global_cfg.get("log")
+    log_enabled = isinstance(log_cfg, dict) and bool(log_cfg.get("enabled"))
+    wsgi_cfg["verbose"] = 3 if log_enabled else 0
+
+    return wsgi_cfg, log_enabled
 
