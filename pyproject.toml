@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "drivedav"
-version = "2.1.0"
+version = "2.1.1"
 description = "一个挂载网盘为 WebDAV 的轻量级工具，默认支持阿里云盘，可扩展其他网盘。"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -15,8 +15,8 @@ authors = [
 ]
 
 dependencies = [
-    "wsgidav==4.3.3",
-    "cheroot==11.1.2",
+    "wsgidav>=4.4.0",
+    "cheroot>=11.1.2",
     "cryptography>=3.4.8",
     "platformdirs>=4.5.1",
     "requests>=2.32.5",
